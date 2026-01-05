@@ -10,14 +10,10 @@ It consists of three main layers:
 3. **Prediction & Serving**
 
 ## 2. Data Flow Diagram
-Traffic Sensors (NYC DOT)
-↓
-Data Ingestion Script
-↓
-Time-Series Database
-↓
-Feature Engineering & ML Models
-↓
+Traffic Sensors (NYC DOT) ↓  
+Data Ingestion Script ↓  
+Time-Series Database ↓  
+Feature Engineering & ML Models ↓  
 Real-Time Prediction API → Users / Applications
 
 
