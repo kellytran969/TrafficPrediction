@@ -1,4 +1,4 @@
-# TrafficPrediction
+# Traffic Prediction
 Predict traffic in NYC
 This project collects and analyzes real-time traffic data from NYC DOT sensors and lays the foundation for a traffic prediction system.
 
