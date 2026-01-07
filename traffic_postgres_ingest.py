@@ -1,44 +1,42 @@
 import requests
-import cx_Oracle
-from datetime import datetime
+import psycopg2
+from psycopg2.extras import execute_values
+from datetime import datetime, timedelta
 import time
 import json
 
 class TrafficDataPipeline:
     """
-    Complete traffic data pipeline:
+    Complete traffic data pipeline with PostgreSQL:
     1. Fetch from NYC Open Data
-    2. Store in Oracle Database
+    2. Store in PostgreSQL
     3. Provide analytics
     """
     
     def __init__(self, db_config):
         """
-        Initialize with Oracle DB connection config
+        Initialize with PostgreSQL connection config
         
         Args:
-            db_config: dict with keys: user, password, host, port, service_name
+            db_config: dict with keys: host, port, database, user, password
         """
         self.api_url = "https://data.cityofnewyork.us/resource/i4gi-tjb9.json"
         self.db_config = db_config
         self.connection = None
         
     def connect_db(self):
-        """Establish connection to Oracle Database"""
+        """Establish connection to PostgreSQL"""
         try:
-            dsn = cx_Oracle.makedsn(
-                self.db_config['host'],
-                self.db_config['port'],
-                service_name=self.db_config['service_name']
-            )
-            self.connection = cx_Oracle.connect(
+            self.connection = psycopg2.connect(
+                host=self.db_config['host'],
+                port=self.db_config['port'],
+                database=self.db_config['database'],
                 user=self.db_config['user'],
-                password=self.db_config['password'],
-                dsn=dsn
+                password=self.db_config['password']
             )
-            print("✓ Connected to Oracle Database")
+            print("✓ Connected to PostgreSQL")
             return True
-        except cx_Oracle.Error as error:
+        except Exception as error:
             print(f"❌ Database connection error: {error}")
             return False
     
@@ -64,8 +62,8 @@ class TrafficDataPipeline:
     
     def insert_traffic_data(self, records):
         """
-        Insert traffic records into Oracle Database
-        Uses batch insert for performance
+        Insert traffic records into PostgreSQL
+        Uses ON CONFLICT to handle duplicates
         """
         if not self.connection:
             print("❌ No database connection")
@@ -73,28 +71,17 @@ class TrafficDataPipeline:
         
         cursor = self.connection.cursor()
         
-        # SQL INSERT with MERGE to handle duplicates
+        # SQL INSERT with ON CONFLICT (upsert)
         insert_sql = """
-            MERGE INTO traffic_data t
-            USING (
-                SELECT 
-                    :1 AS time_stamp,
-                    :2 AS link_id,
-                    :3 AS link_name,
-                    :4 AS borough,
-                    :5 AS speed,
-                    :6 AS travel_time,
-                    :7 AS status,
-                    :8 AS data_as_of,
-                    :9 AS owner
-                FROM DUAL
-            ) s
-            ON (t.link_id = s.link_id AND t.time_stamp = s.time_stamp)
-            WHEN NOT MATCHED THEN
-                INSERT (time_stamp, link_id, link_name, borough, speed, 
-                        travel_time, status, data_as_of, owner)
-                VALUES (s.time_stamp, s.link_id, s.link_name, s.borough, s.speed,
-                        s.travel_time, s.status, s.data_as_of, s.owner)
+            INSERT INTO traffic_data 
+                (time_stamp, link_id, link_name, borough, speed, 
+                 travel_time, status, data_as_of, owner)
+            VALUES %s
+            ON CONFLICT (link_id, time_stamp) 
+            DO UPDATE SET
+                speed = EXCLUDED.speed,
+                travel_time = EXCLUDED.travel_time,
+                status = EXCLUDED.status
         """
         
         # Prepare batch data
@@ -102,7 +89,12 @@ class TrafficDataPipeline:
         for record in records:
             # Parse timestamp
             try:
-                ts = datetime.fromisoformat(record.get('data_as_of', '').replace('Z', '+00:00'))
+                ts_str = record.get('data_as_of', '')
+                if ts_str:
+                    # Handle ISO format with 'T' and 'Z'
+                    ts = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+                else:
+                    ts = datetime.utcnow()
             except:
                 ts = datetime.utcnow()
             
@@ -119,14 +111,14 @@ class TrafficDataPipeline:
             ))
         
         try:
-            # Execute batch insert
-            cursor.executemany(insert_sql, batch_data)
+            # Execute batch insert using execute_values (much faster)
+            execute_values(cursor, insert_sql, batch_data)
             self.connection.commit()
             inserted = cursor.rowcount
             cursor.close()
             print(f"✓ Inserted/Updated {inserted} records")
             return inserted
-        except cx_Oracle.Error as error:
+        except Exception as error:
             print(f"❌ Insert error: {error}")
             self.connection.rollback()
             cursor.close()
@@ -154,6 +146,10 @@ class TrafficDataPipeline:
         stats['earliest_data'] = date_range[0]
         stats['latest_data'] = date_range[1]
         
+        # Unique links
+        cursor.execute("SELECT COUNT(DISTINCT link_id) FROM traffic_data")
+        stats['unique_links'] = cursor.fetchone()[0]
+        
         # Records by borough
         cursor.execute("""
             SELECT borough, COUNT(*) as count
@@ -163,16 +159,28 @@ class TrafficDataPipeline:
         """)
         stats['by_borough'] = cursor.fetchall()
         
-        # Average speed by borough (recent data)
+        # Average speed by borough (recent data - last hour)
         cursor.execute("""
-            SELECT borough, ROUND(AVG(speed), 2) as avg_speed
+            SELECT borough, ROUND(AVG(speed)::numeric, 2) as avg_speed
             FROM traffic_data
-            WHERE time_stamp >= SYSTIMESTAMP - INTERVAL '1' HOUR
+            WHERE time_stamp >= NOW() - INTERVAL '1 hour'
             AND speed > 0
             GROUP BY borough
             ORDER BY avg_speed
         """)
         stats['avg_speed_by_borough'] = cursor.fetchall()
+        
+        # Most congested links (last hour)
+        cursor.execute("""
+            SELECT link_name, borough, ROUND(AVG(speed)::numeric, 2) as avg_speed
+            FROM traffic_data
+            WHERE time_stamp >= NOW() - INTERVAL '1 hour'
+            AND speed > 0
+            GROUP BY link_name, borough
+            ORDER BY avg_speed
+            LIMIT 5
+        """)
+        stats['most_congested'] = cursor.fetchall()
         
         cursor.close()
         return stats
@@ -184,24 +192,36 @@ class TrafficDataPipeline:
         print(f"{'='*80}\n")
         
         print(f"📊 OVERALL")
-        print(f"Total records: {stats['total_records']:,}")
-        print(f"Data range: {stats['earliest_data']} to {stats['latest_data']}")
+        print(f"  Total records: {stats['total_records']:,}")
+        print(f"  Unique road links: {stats['unique_links']:,}")
+        if stats['earliest_data'] and stats['latest_data']:
+            duration = stats['latest_data'] - stats['earliest_data']
+            print(f"  Data range: {stats['earliest_data']} to {stats['latest_data']}")
+            print(f"  Duration: {duration}")
         print()
         
-        print(f"🗽 RECORDS BY BOROUGH")
-        for borough, count in stats['by_borough']:
-            print(f"  {borough}: {count:,}")
-        print()
+        if stats['by_borough']:
+            print(f"🗽 RECORDS BY BOROUGH")
+            for borough, count in stats['by_borough']:
+                print(f"  {borough}: {count:,}")
+            print()
         
-        print(f"🚗 AVERAGE SPEED (Last Hour)")
-        for borough, avg_speed in stats['avg_speed_by_borough']:
-            print(f"  {borough}: {avg_speed} mph")
-        print()
+        if stats['avg_speed_by_borough']:
+            print(f"🚗 AVERAGE SPEED (Last Hour)")
+            for borough, avg_speed in stats['avg_speed_by_borough']:
+                print(f"  {borough}: {avg_speed} mph")
+            print()
+        
+        if stats['most_congested']:
+            print(f"🚨 MOST CONGESTED LINKS (Last Hour)")
+            for idx, (link_name, borough, avg_speed) in enumerate(stats['most_congested'], 1):
+                print(f"  {idx}. {link_name} ({borough}): {avg_speed} mph")
+            print()
     
     def run_collection_cycle(self):
         """Run one complete data collection cycle"""
         print(f"\n{'='*80}")
-        print(f"STARTING DATA COLLECTION - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f"COLLECTION CYCLE - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
         print(f"{'='*80}\n")
         
         # Fetch data
@@ -215,7 +235,7 @@ class TrafficDataPipeline:
         print(f"✓ Fetched {len(raw_data)} records")
         
         # Connect to DB
-        print("\n2. Connecting to Oracle Database...")
+        print("\n2. Connecting to PostgreSQL...")
         if not self.connect_db():
             return False
         
@@ -232,8 +252,8 @@ class TrafficDataPipeline:
         # Disconnect
         self.disconnect_db()
         
-        print(f"\n{'='*80}")
-        print(f"COLLECTION CYCLE COMPLETE")
+        print(f"{'='*80}")
+        print(f"CYCLE COMPLETE ✓")
         print(f"{'='*80}\n")
         
         return True
@@ -248,20 +268,20 @@ def continuous_collection(interval_minutes=5):
     """
     # Database configuration
     db_config = {
-        'user': 'traffic_user',
-        'password': 'TrafficPass123',
         'host': 'localhost',
-        'port': 1521,
-        'service_name': 'XEPDB1'
+        'port': 5432,
+        'database': 'traffic_db',
+        'user': 'traffic_user',
+        'password': 'traffic123'
     }
     
     pipeline = TrafficDataPipeline(db_config)
     
     print("="*80)
-    print("TRAFFIC DATA COLLECTION PIPELINE")
+    print("TRAFFIC DATA COLLECTION PIPELINE - PostgreSQL")
     print("="*80)
     print(f"Collection interval: {interval_minutes} minutes")
-    print(f"Target: Oracle Database XE at {db_config['host']}:{db_config['port']}")
+    print(f"Target: PostgreSQL at {db_config['host']}:{db_config['port']}/{db_config['database']}")
     print(f"Press Ctrl+C to stop")
     print("="*80)
     
@@ -275,11 +295,12 @@ def continuous_collection(interval_minutes=5):
             success = pipeline.run_collection_cycle()
             
             if success:
-                print(f"\n⏰ Sleeping for {interval_minutes} minutes...")
-                print(f"Next collection at: {datetime.now() + timedelta(minutes=interval_minutes)}")
+                next_run = datetime.now() + timedelta(minutes=interval_minutes)
+                print(f"⏰ Next collection at: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"Sleeping for {interval_minutes} minutes...")
                 time.sleep(interval_minutes * 60)
             else:
-                print("\n⚠️  Error in cycle, retrying in 1 minute...")
+                print("⚠️  Error in cycle, retrying in 1 minute...")
                 time.sleep(60)
                 
     except KeyboardInterrupt:
@@ -287,17 +308,14 @@ def continuous_collection(interval_minutes=5):
         print(f"Total cycles completed: {cycle_count}")
 
 
-# One-time collection
 def single_collection():
     """Run a single data collection cycle"""
-    from datetime import timedelta
-    
     db_config = {
-        'user': 'traffic_user',
-        'password': 'TrafficPass123',
         'host': 'localhost',
-        'port': 1521,
-        'service_name': 'XEPDB1'
+        'port': 5432,
+        'database': 'traffic_db',
+        'user': 'traffic_user',
+        'password': 'traffic123'
     }
     
     pipeline = TrafficDataPipeline(db_config)
@@ -305,15 +323,16 @@ def single_collection():
 
 
 if __name__ == "__main__":
-    import sys
-    from datetime import timedelta
-    
-    print("Traffic Data to Oracle Pipeline")
+    print("\n" + "="*80)
+    print("TRAFFIC DATA TO POSTGRESQL PIPELINE")
+    print("="*80)
+    print("\nOptions:")
     print("1. Run single collection")
     print("2. Run continuous collection (every 5 minutes)")
     print("3. Run continuous collection (every 10 minutes)")
+    print("4. Run continuous collection (every 1 minute - for testing)")
     
-    choice = input("\nEnter choice (1/2/3): ").strip()
+    choice = input("\nEnter choice (1/2/3/4): ").strip()
     
     if choice == "1":
         single_collection()
@@ -321,6 +340,8 @@ if __name__ == "__main__":
         continuous_collection(interval_minutes=5)
     elif choice == "3":
         continuous_collection(interval_minutes=10)
+    elif choice == "4":
+        continuous_collection(interval_minutes=1)
     else:
         print("Invalid choice. Running single collection...")
         single_collection()
