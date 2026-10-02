@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+traffic.db
+ml/artifacts/*.joblib
+ml/artifacts/metrics.json
+node_modules/
+frontend/dist/
+data/historical/*.csv
+!data/historical/.gitkeep
+.pytest_cache/
