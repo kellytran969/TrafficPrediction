@@ -1,0 +1,77 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: traffic
+      POSTGRES_PASSWORD: traffic
+      POSTGRES_DB: traffic
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7
+    ports:
+      - "6379:6379"
+
+  simulator:
+    build: .
+    command: ["python", "-m", "services.simulator.main", "--mode", "live", "--rate", "20"]
+    env_file: .env
+    depends_on: [redis]
+
+  ingestion:
+    build: .
+    command: ["python", "-m", "services.ingestion.main", "--batch-size", "500"]
+    env_file: .env
+    depends_on: [postgres, redis]
+
+  api:
+    build: .
+    command: ["uvicorn", "services.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./ml/artifacts:/app/ml/artifacts
+    depends_on: [postgres, redis]
+
+  frontend:
+    image: node:20-slim
+    working_dir: /app
+    command: ["sh", "-c", "npm install && npm run dev -- --host --port 5173"]
+    volumes:
+      - ./frontend:/app
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:8000
+    depends_on: [api]
+
+  # one-shot jobs (run on demand, not on `docker compose up`)
+  historical-data:
+    build: .
+    command: ["python", "scripts/generate_historical.py", "--months", "3"]
+    volumes:
+      - ./data/historical:/app/data/historical
+    profiles: [jobs]
+
+  etl:
+    build: .
+    command: ["python", "-m", "pipelines.etl.main", "--days", "90"]
+    env_file: .env
+    depends_on: [postgres]
+    profiles: [jobs]
+
+  train:
+    build: .
+    command: ["python", "-m", "ml.train", "--days", "90"]
+    env_file: .env
+    volumes:
+      - ./ml/artifacts:/app/ml/artifacts
+    depends_on: [postgres]
+    profiles: [jobs]
+
+volumes:
+  pgdata:

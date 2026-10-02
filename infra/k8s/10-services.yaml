@@ -1,0 +1,128 @@
+# ---- Prediction API (public, autoscaled) ----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: traffic-prediction
+spec:
+  replicas: 3
+  selector:
+    matchLabels: { app: api }
+  template:
+    metadata:
+      labels: { app: api }
+    spec:
+      containers:
+        - name: api
+          image: traffic-prediction:latest
+          command: ["uvicorn", "services.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+          envFrom: [{ configMapRef: { name: traffic-config } }]
+          ports: [{ containerPort: 8000 }]
+          readinessProbe:
+            httpGet: { path: /health, port: 8000 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+            limits: { cpu: "1000m", memory: "1Gi" }
+          volumeMounts: [{ name: models, mountPath: /app/ml/artifacts }]
+      volumes:
+        - name: models
+          persistentVolumeClaim: { claimName: model-artifacts }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: traffic-prediction
+spec:
+  selector: { app: api }
+  ports: [{ port: 80, targetPort: 8000 }]
+  type: LoadBalancer
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: api
+  namespace: traffic-prediction
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: api }
+  minReplicas: 3
+  maxReplicas: 20
+  metrics:
+    - type: Resource
+      resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } }
+---
+# ---- Ingestion (stream -> postgres) ----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ingestion
+  namespace: traffic-prediction
+spec:
+  replicas: 2
+  selector:
+    matchLabels: { app: ingestion }
+  template:
+    metadata:
+      labels: { app: ingestion }
+    spec:
+      containers:
+        - name: ingestion
+          image: traffic-prediction:latest
+          command: ["python", "-m", "services.ingestion.main", "--batch-size", "1000"]
+          envFrom: [{ configMapRef: { name: traffic-config } }]
+          resources:
+            requests: { cpu: "250m", memory: "512Mi" }
+---
+# ---- Simulator (synthetic sensor feed) ----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: simulator
+  namespace: traffic-prediction
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: simulator }
+  template:
+    metadata:
+      labels: { app: simulator }
+    spec:
+      containers:
+        - name: simulator
+          image: traffic-prediction:latest
+          command: ["python", "-m", "services.simulator.main", "--mode", "live", "--rate", "50"]
+          envFrom: [{ configMapRef: { name: traffic-config } }]
+---
+# ---- Model training (nightly CronJob) ----
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: train
+  namespace: traffic-prediction
+spec:
+  schedule: "0 3 * * *"  # retrain nightly on fresh warehouse data
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: train
+              image: traffic-prediction:latest
+              command: ["sh", "-c",
+                "python -m pipelines.etl.main --days 90 && python -m ml.train --days 90"]
+              envFrom: [{ configMapRef: { name: traffic-config } }]
+              volumeMounts: [{ name: models, mountPath: /app/ml/artifacts }]
+          volumes:
+            - name: models
+              persistentVolumeClaim: { claimName: model-artifacts }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-artifacts
+  namespace: traffic-prediction
+spec:
+  accessModes: [ReadWriteMany]
+  resources: { requests: { storage: 5Gi } }

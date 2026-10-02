@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: traffic-prediction
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: traffic-config
+  namespace: traffic-prediction
+data:
+  DATABASE_URL: "postgresql+psycopg2://traffic:traffic@postgres:5432/traffic"
+  REDIS_URL: "redis://redis:6379/0"
+  STREAM_BACKEND: "redis"
+  CACHE_BACKEND: "redis"
+  MODEL_DIR: "/app/ml/artifacts"
+---
+# ---- Postgres ----
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: traffic-prediction
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels: { app: postgres }
+  template:
+    metadata:
+      labels: { app: postgres }
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16
+          env:
+            - { name: POSTGRES_USER, value: traffic }
+            - { name: POSTGRES_PASSWORD, valueFrom: { secretKeyRef: { name: traffic-secrets, key: pg-password } } }
+            - { name: POSTGRES_DB, value: traffic }
+          ports: [{ containerPort: 5432 }]
+          volumeMounts: [{ name: pgdata, mountPath: /var/lib/postgresql/data }]
+  volumeClaimTemplates:
+    - metadata: { name: pgdata }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 20Gi } }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: traffic-prediction
+spec:
+  selector: { app: postgres }
+  ports: [{ port: 5432 }]
+---
+# ---- Redis ----
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: traffic-prediction
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: redis }
+  template:
+    metadata:
+      labels: { app: redis }
+    spec:
+      containers:
+        - name: redis
+          image: redis:7
+          ports: [{ containerPort: 6379 }]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: traffic-prediction
+spec:
+  selector: { app: redis }
+  ports: [{ port: 6379 }]
