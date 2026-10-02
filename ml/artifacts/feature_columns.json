@@ -1,0 +1,12 @@
+[
+  "hour_of_day",
+  "day_of_week",
+  "month",
+  "is_weekend",
+  "is_rush",
+  "lag_1h",
+  "lag_24h",
+  "roll_3h",
+  "lag_vol_1h",
+  "occupancy_now"
+]
